@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no" />
+<title>Bahçe: Mobil Optimizasyonlu Oyun</title>
+<style>
+  :root{--ui-z:1000}
+  html,body{height:100%;margin:0;padding:0;overflow:hidden;-webkit-user-select:none;user-select:none;touch-action:none;background:#87CEEB;font-family:Inter,Arial,Helvetica,sans-serif}
+  canvas{display:block; width:100%; height:100%; background:transparent}
+  /* UI layer (touch events disabled so canvas gets touches) */
+  #ui { position:fixed; inset:0; pointer-events:none; z-index:var(--ui-z); }
+  #header{position:absolute;top:14px;left:0;width:100%;text-align:center;pointer-events:none}
+  #title{margin:0;color:#E65100;font-size:20px;text-shadow:1px 1px #fff}
+  #score{display:inline-block;margin-top:6px;background:rgba(255,255,255,0.9);padding:6px 12px;border-radius:14px;font-weight:700;color:#00695C}
+  /* start overlay */
+  #overlay { position:fixed;inset:0;background:rgba(0,0,0,0.85);display:flex;align-items:center;justify-content:center;flex-direction:column;z-index:1100 }
+  #startBtn{pointer-events:auto;background:linear-gradient(45deg,#FF6F00,#FFD54F);border:3px solid #fff;color:#fff;padding:18px 44px;border-radius:40px;font-size:22px;cursor:pointer;box-shadow:0 6px 30px rgba(0,0,0,0.35)}
+  #author{color:#ddd;margin-top:12px;font-size:13px}
+  /* tool buttons (visual, pointer-events:auto) */
+  #controls { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); display:flex; gap:12px; z-index:1200; pointer-events:auto; }
+  .ctl { background:rgba(255,255,255,0.95); border-radius:12px; padding:10px 14px; font-weight:700; font-size:16px; box-shadow:0 6px 18px rgba(0,0,0,0.15); cursor:pointer; border:2px solid #eee; }
+  .ctl.active{outline:3px solid rgba(0,150,255,0.15)}
+  /* debug */
+  #debug { position:fixed; top:0; left:0; right:0; color:#fff; background:rgba(200,0,0,0.85); font-family:monospace; font-size:12px; padding:8px; display:none; z-index:2000; }
+  /* hint */
+  #hint{position:fixed; left:12px; bottom:20px; background:rgba(255,255,255,0.92); padding:8px 10px; border-radius:10px; font-size:13px; color:#222; pointer-events:none; z-index:1200}
+</style>
+</head>
+<body>
+  <div id="debug"></div>
+
+  <div id="overlay">
+    <button id="startBtn">OYUNA BAŞLA</button>
+    <div id="author">Yapımcı: Mustafa KARAMEŞE</div>
+  </div>
+
+  <div id="ui">
+    <div id="header">
+      <h1 id="title">80.Yıl Anaokulu</h1>
+      <div id="score">Çöpler: 0 / 6</div>
+    </div>
+  </div>
+
+  <canvas id="c"></canvas>
+
+  <div id="controls" style="display:none">
+    <div id="btnGrab" class="ctl active" role="button" aria-pressed="true">1 • Çöp Aleti 🦯</div>
+    <div id="btnWater" class="ctl" role="button" aria-pressed="false">2 • Sulama 🪣</div>
+  </div>
+
+  <div id="hint">1 veya 2 ile araç değiştir • Çöpleri sürükle ve kutuya bırak • Önce çöp, sonra sulama</div>
+
+<script>
+/* =========================
+   Mobil-optimised Bahçe Oyunu
+   - dokunma/mouse uyumlu
+   - yüksek performans
+   - tek dosya
+   ========================= */
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', {alpha:false});
+let W=0, H=0, DPR=1;
+function setSize(){
+  DPR = Math.max(1, window.devicePixelRatio || 1);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  canvas.width = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener('resize', setSize);
+setSize();
+
+/* UI refs */
+const overlay = document.getElementById('overlay');
+const startBtn = document.getElementById('startBtn');
+const scoreEl = document.querySelector('#score');
+const controls = document.getElementById('controls');
+const btnGrab = document.getElementById('btnGrab');
+const btnWater = document.getElementById('btnWater');
+const debug = document.getElementById('debug');
+
+/* Game state */
+let state = 0; // 0: waiting, 1: collect trash, 2: water flowers, 3: victory
+let score = 0;
+const TOTAL_TRASH = 6;
+
+let items = []; // trash items
+let flowers = []; // flowers list
+let particles = []; // water particles
+let dragItem = null; // currently dragging trash
+let pointer = {x:0,y:0,down:false};
+let currentTool = 'grabber'; // 'grabber' or 'watering'
+
+/* Audio init (user gesture needed) */
+let audioCtx = null;
+function initAudio(){
+  try{
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if(AC && !audioCtx) {
+      audioCtx = new AC();
+      if(audioCtx.state === 'suspended') audioCtx.resume().catch(()=>{});
+    }
+  }catch(e){ console.warn('audio init', e); }
+}
+function playTone(freq=440,type='sine',dur=0.08){
+  if(!audioCtx) return;
+  try{
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.09,audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  }catch(e){}
+}
+
+/* Helpers for pointer coordinates (touch or mouse) */
+function getPointerFromEvent(e){
+  if(e.touches && e.touches.length>0) {
+    return {x: e.touches[0].clientX, y: e.touches[0].clientY};
+  } else if(e.changedTouches && e.changedTouches.length>0) {
+    return {x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY};
+  } else {
+    return {x: e.clientX, y: e.clientY};
+  }
+}
+
+/* Create level with trash and flowers */
+function createLevel(){
+  items = [];
+  flowers = [];
+  particles = [];
+  score = 0;
+  state = 1;
+  scoreEl.innerText = `Çöpler: ${score} / ${TOTAL_TRASH}`;
+  // trash positions (random spread, avoid edges)
+  const icons = ['🥤','📄','🍌','🥡','🗞️','🍎'];
+  for(let i=0;i<TOTAL_TRASH;i++){
+    items.push({
+      id:i,
+      x: 60 + Math.random()*(W-120),
+      y: H - 160 - Math.random()*220,
+      icon: icons[i % icons.length],
+      angle: (Math.random()-0.5)*0.5,
+      r: 38,
+      drag:false
+    });
+  }
+  // flowers (5)
+  for(let j=0;j<5;j++){
+    flowers.push({
+      x: (W/6)*(j+1),
+      y: H - 60,
+      hp: 0,
+      color: 'hsl(' + Math.floor(Math.random()*360) + ',70%,60%)'
+    });
+  }
+}
+
+/* Touch + mouse events, mobile safe */
+canvas.addEventListener('touchstart', function(e){ e.preventDefault(); const p = getPointerFromEvent(e); pointer.x=p.x; pointer.y=p.y; pointer.down=true; handleDown(e); }, {passive:false});
+canvas.addEventListener('touchmove', function(e){ e.preventDefault(); const p = getPointerFromEvent(e); pointer.x=p.x; pointer.y=p.y; handleMove(e); }, {passive:false});
+canvas.addEventListener('touchend', function(e){ e.preventDefault(); pointer.down=false; handleUp(e); }, {passive:false});
+canvas.addEventListener('mousedown', function(e){ pointer = {...pointer, ...getPointerFromEvent(e), down:true}; handleDown(e); });
+canvas.addEventListener('mousemove', function(e){ pointer = {...pointer, ...getPointerFromEvent(e)}; handleMove(e); });
+canvas.addEventListener('mouseup', function(e){ pointer.down=false; handleUp(e); });
+
+/* Keyboard shortcuts for desktop */
+window.addEventListener('keydown', (e)=>{
+  if(e.key === '1'){ setTool('grabber'); }
+  if(e.key === '2'){ setTool('watering'); }
+});
+
+/* Tool buttons */
+btnGrab.addEventListener('click', ()=> setTool('grabber'));
+btnWater.addEventListener('click', ()=> setTool('watering'));
+function setTool(tool){
+  currentTool = tool;
+  btnGrab.classList.toggle('active', tool==='grabber');
+  btnWater.classList.toggle('active', tool==='watering');
+  btnGrab.setAttribute('aria-pressed', tool==='grabber');
+  btnWater.setAttribute('aria-pressed', tool==='watering');
+}
+
+/* Interaction handlers */
+function handleDown(e){
+  const p = getPointerFromEvent(e);
+  // if waiting, ignore
+  if(state === 0) return;
+  // If we are in trash-collecting state and using grabber: check if touching a trash
+  if(state === 1 && currentTool === 'grabber'){
+    for(let i = items.length-1;i>=0;i--){
+      const it = items[i];
+      const dx = p.x - it.x;
+      const dy = p.y - it.y;
+      if(Math.sqrt(dx*dx + dy*dy) < it.r + 8){
+        dragItem = it;
+        it.drag = true;
+        playTone(300,'triangle',0.08);
+        break;
+      }
+    }
+  }
+  // If water mode and in watering state: spawn initial particles at touch point
+  if(state === 2 && currentTool === 'watering'){
+    spawnWaterAt(p.x, p.y, 6);
+    playTone(800,'sine',0.06);
+  }
+}
+
+function handleMove(e){
+  // if dragging item, move it
+  if(dragItem){
+    dragItem.x = pointer.x;
+    dragItem.y = pointer.y;
+  }
+}
+
+function handleUp(e){
+  // if a dragItem exists, check if dropped inside bin region
+  if(dragItem){
+    if(dragItem.x > W - 160 && dragItem.y > H - 220){
+      // remove
+      const idx = items.indexOf(dragItem);
+      if(idx > -1){
+        items.splice(idx,1);
+        score++;
+        scoreEl.innerText = `Çöpler: ${score} / ${TOTAL_TRASH}`;
+        playTone(150,'sawtooth',0.12);
+      }
+    }
+    dragItem.drag = false;
+    dragItem = null;
+
+    // if all cleaned -> switch to watering stage
+    if(items.length === 0){
+      state = 2;
+      scoreEl.innerText = "Şimdi Çiçekleri Sula!";
+      scoreEl.style.backgroundColor = "gold";
+      // auto-switch tool to watering for convenience on mobile
+      setTool('watering');
+      playTone(700,'square',0.18);
+    }
+  }
+}
+
+/* Water particle spawner */
+function spawnWaterAt(x,y,count=4){
+  for(let i=0;i<count;i++){
+    particles.push({
+      x: x + (Math.random()-0.5)*24,
+      y: y + (Math.random()-0.5)*12,
+      vx: (Math.random()-0.5)*1.2,
+      vy: 3 + Math.random()*3,
+      life: 1
+    });
+  }
+}
+
+/* Flower check & growth */
+function checkWin(){
+  let allFull = true;
+  for(const f of flowers) if(f.hp < 100) { allFull = false; break; }
+  if(allFull && state !== 3){
+    state = 3;
+    playTone(523,'sine',0.22);
+    setTimeout(()=>playTone(659,'sine',0.18),200);
+    setTimeout(()=>playTone(783,'sine',0.32),420);
+  }
+}
+
+/* Drawing helpers */
+function drawCloud(x,y,w,h,alpha=1){
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.ellipse(x, y, w*0.52, h*0.52, 0, 0, Math.PI*2);
+  ctx.ellipse(x + w*0.28, y - h*0.16, w*0.38, h*0.38, 0, 0, Math.PI*2);
+  ctx.ellipse(x - w*0.28, y - h*0.12, w*0.34, h*0.34, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawFlower(f){
+  const g = f.hp / 100;
+  // stem
+  ctx.strokeStyle = 'green';
+  ctx.lineWidth = 5 + (5 * g);
+  ctx.beginPath();
+  ctx.moveTo(f.x, H - 80);
+  ctx.quadraticCurveTo(f.x, H - 130, f.x, H - 80 - (50 + 80 * g));
+  ctx.stroke();
+
+  // head
+  ctx.save();
+  ctx.translate(f.x, H - 80 - (50 + 80 * g));
+  const scale = 0.25 + (0.85 * g);
+  ctx.scale(scale, scale);
+  if(g < 0.35){
+    ctx.font = '44px Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('🥀', 0, 0);
+  } else {
+    // petals
+    ctx.fillStyle = f.color;
+    for(let i=0;i<6;i++){
+      ctx.beginPath();
+      ctx.rotate(Math.PI/3);
+      ctx.ellipse(0, -26, 12, 28, 0, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.fillStyle = 'yellow';
+    ctx.beginPath();
+    ctx.arc(0,0,16,0,Math.PI*2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+/* Tool pointer drawing */
+function drawToolPointer(){
+  // draw grabber when pointer near trash or dragging
+  let showGrab = false;
+  if(dragItem) showGrab = true;
+  else {
+    for(const it of items){
+      const dx = pointer.x - it.x;
+      const dy = pointer.y - it.y;
+      if(Math.sqrt(dx*dx + dy*dy) < it.r + 24) { showGrab = true; break; }
+    }
+  }
+  if(state === 1 && showGrab){
+    ctx.font = '48px Arial';
+    ctx.fillText('🦯', pointer.x, pointer.y);
+  }
+  // watering pointer when in water stage + currentTool
+  if(state === 2 && currentTool === 'watering'){
+    ctx.font = '52px Arial';
+    ctx.fillText('🪣', pointer.x, pointer.y);
+  }
+}
+
+/* Main render loop */
+function loop(){
+  // background gradient sky
+  const sky = ctx.createLinearGradient(0,0,0,H);
+  sky.addColorStop(0, '#87CEEB');
+  sky.addColorStop(0.6, '#C7EEFF');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0,0,W,H);
+
+  // sun
+  ctx.save();
+  ctx.beginPath();
+  ctx.fillStyle = '#FFD54F';
+  ctx.shadowColor = 'rgba(255,215,0,0.6)';
+  ctx.shadowBlur = 20;
+  ctx.arc(W - 110, 90, 42, 0, Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+
+  // moving clouds
+  const t = Date.now()*0.00018;
+  drawCloud(W*0.12 + Math.sin(t)*42, 80, 160, 70, 0.95);
+  drawCloud(W*0.48 + Math.cos(t*1.2)*48, 120, 200, 90, 0.97);
+  drawCloud(W*0.78 + Math.sin(t*0.7)*30, 60, 150, 60, 0.9);
+
+  // ground
+  ctx.fillStyle = '#4CAF50';
+  ctx.fillRect(0,H-120,W,120);
+  ctx.fillStyle = '#5D4037';
+  ctx.fillRect(0,H-40,W,40);
+
+  // flowers
+  for(const f of flowers) drawFlower(f);
+
+  // trash bin
+  ctx.fillStyle = '#333';
+  ctx.fillRect(W - 160, H - 220, 140, 180);
+  ctx.fillStyle = 'white';
+  ctx.font = '40px Arial';
+  ctx.textAlign = 'center';
+  ctx.fillText('♻️', W - 90, H - 130);
+
+  // trash items
+  ctx.font = '56px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for(const it of items){
+    ctx.save();
+    ctx.translate(it.x, it.y);
+    if(it.drag){
+      ctx.scale(1.25,1.25);
+      ctx.shadowBlur = 20;
+      ctx.shadowColor = 'rgba(0,0,0,0.45)';
+      ctx.rotate(0);
+    } else {
+      ctx.rotate(it.angle);
+    }
+    ctx.fillText(it.icon, 0, 0);
+    ctx.restore();
+  }
+
+  // particles (water)
+  if(items.length === 0 || state === 2){
+    for(let i=particles.length-1;i>=0;i--){
+      const p = particles[i];
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vy += 0.06;
+      p.life -= 0.02;
+      if(p.life > 0){
+        ctx.globalAlpha = Math.max(0, p.life);
+        ctx.fillStyle = '#00BFFF';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 5, 0, Math.PI*2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        // interaction with flower
+        if(p.y > H - 180){
+          for(const f of flowers){
+            if(Math.abs(p.x - f.x) < 60 && f.hp < 100){
+              f.hp = Math.min(100, f.hp + 2);
+              p.life = 0;
+              checkWin();
+            }
+          }
+        }
+      } else particles.splice(i,1);
+    }
+  }
+
+  // draw pointer tool (emoji)
+  drawToolPointer();
+
+  // victory confetti
+  if(state === 3){
+    if(Math.random() > 0.82){
+      ctx.fillStyle = 'hsl(' + Math.random()*360 + ',80%,60%)';
+      ctx.fillRect(Math.random()*W, Math.random()*H, 6, 6);
+    }
+    ctx.fillStyle = 'white';
+    ctx.font = 'bold 44px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('GÖREV TAMAMLANDI!', W/2, H/2 - 20);
+  }
+
+  requestAnimationFrame(loop);
+}
+
+/* Periodically spawn water particles while in watering stage (gentle rain) when user not touching */
+setInterval(()=>{
+  if(state === 2 && !pointer.down){
+    spawnWaterAt(Math.random()*W, 60 + Math.random()*70, 1);
+  }
+}, 650);
+
+/* start button handler */
+startBtn.addEventListener('click', ()=>{
+  initAudio();
+  overlay.style.display = 'none';
+  controls.style.display = 'flex';
+  createLevel();
+  // start render loop
+  requestAnimationFrame(loop);
+});
+
+/* Extra: pointer move global update (for tool emoji alignment on screen even if events not on canvas) */
+window.addEventListener('mousemove', e => { pointer.x = e.clientX; pointer.y = e.clientY; });
+window.addEventListener('touchmove', e => { if(e.touches && e.touches[0]){ pointer.x = e.touches[0].clientX; pointer.y = e.touches[0].clientY; } }, {passive:false});
+
+/* Small utility: spawn water quickly at a coordinate (also used on pointerdown when in water mode) */
+function spawnWaterAt(x,y,count=3){
+  for(let i=0;i<count;i++){
+    particles.push({
+      x: x + (Math.random()-0.5)*24,
+      y: y + (Math.random()-0.5)*10,
+      vx: (Math.random()-0.5)*1.2,
+      vy: 3 + Math.random()*3,
+      life: 1
+    });
+  }
+}
+
+/* Accessibility: show debug (if errors) */
+window.onerror = function(msg, url, line){
+  debug.style.display = 'block';
+  debug.innerText += `HATA: ${msg} (Satır: ${line})\n`;
+};
+
+/* Ready - set default tool */
+setTool('grabber');
+
+</script>
+</body>
+</html>
